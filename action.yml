@@ -1,0 +1,102 @@
+# `screenery/push@v1` — the four-line Action from spec §17.
+#
+#   - uses: screenery/push@v1
+#     with: { project: acme/dashboard, path: test-results }
+#
+# A COMPOSITE action, deliberately. A JavaScript action would mean a bundled
+# `dist/` committed to the action's repository and kept in step with the CLI by
+# hand; a composite one runs `npx screenery@<version> push`, so the published
+# npm package is the single implementation and the Action is the four lines of
+# YAML plus the OIDC permission check below.
+#
+# NO TOKEN INPUT. That is the point of the phase: in GitHub Actions the CLI
+# exchanges the runner's OIDC token for a 5-minute publish token (spec §5.1),
+# so there is no secret to pass and none to leak. `SCREENERY_TOKEN` is still
+# read from the environment when a caller sets it — for a self-hosted runner
+# with no OIDC, or a deployment with no GitHub App — but the Action does not
+# offer an input for one, because offering it would make the secret path look
+# like the normal path.
+name: Screenery push
+description: Push product screenshots to Screenery and turn them into living URLs.
+author: Screenery
+
+branding:
+  icon: image
+  color: green
+
+inputs:
+  project:
+    description: >-
+      The Screenery project to publish to, as `{org}/{project}`. This is what
+      picks the destination — one repository can feed several projects (spec
+      §5.1), and each build lands only in the one it names.
+    required: true
+  path:
+    description: Directory of screenshots to push. Walked recursively.
+    required: false
+    default: test-results
+  version:
+    description: >-
+      The `screenery` npm version to run. Pinned by default so a release of the
+      CLI cannot change what a workflow does without the workflow changing.
+    required: false
+    default: '0.1.0'
+  api-url:
+    description: Control plane origin. Only for a non-default deployment.
+    required: false
+    default: ''
+  oidc-audience:
+    description: >-
+      What the OIDC token is minted for. Leave empty: the CLI derives it from
+      `api-url` when that is set, and otherwise uses the production default.
+      Set it only where a deployment validates an audience that is not its own
+      API origin.
+    required: false
+    default: ''
+  force:
+    description: >-
+      Promote even when the channel is ahead (spec §6's fast-forward rule).
+      Off by default; a slow retry of an old commit must not clobber newer
+      content.
+    required: false
+    default: 'false'
+
+runs:
+  using: composite
+  steps:
+    # The permission check is here rather than in the CLI because it is the
+    # one failure a workflow author can fix without reading anything: the job
+    # needs `id-token: write` and nothing else explains its absence as
+    # cheaply. A fork pull request reaches the same state legitimately, so the
+    # step does NOT fail — it prints the difference and lets the CLI decide,
+    # which is where the two paragraphs live (see `packages/cli/src/oidc.ts`).
+    - name: Check OIDC availability
+      shell: bash
+      run: |
+        if [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+          echo "screenery: OIDC available — no token needed."
+        elif [ "${GITHUB_EVENT_NAME:-}" = "pull_request" ]; then
+          echo "screenery: no OIDC token. If this pull request is from a fork, that is expected."
+        else
+          echo "::warning title=Screenery::This job has no OIDC token. Add 'permissions: id-token: write' to the job, or set SCREENERY_TOKEN."
+        fi
+
+    # EVERY INPUT TRAVELS THROUGH `env`, AND NONE IS INTERPOLATED INTO THE
+    # SCRIPT. GitHub expands `${{ inputs.* }}` before bash ever parses the
+    # line, so an input carrying shell syntax would be executed rather than
+    # passed — and a caller is free to map a pull-request-controlled value onto
+    # any of these. Through `env` they are data to bash, whatever they contain.
+    - name: Push screenshots
+      shell: bash
+      env:
+        SCREENERY_API_URL: ${{ inputs.api-url }}
+        SCREENERY_OIDC_AUDIENCE: ${{ inputs.oidc-audience }}
+        INPUT_PATH: ${{ inputs.path }}
+        INPUT_PROJECT: ${{ inputs.project }}
+        INPUT_FORCE: ${{ inputs.force }}
+        INPUT_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        args=("$INPUT_PATH" --project "$INPUT_PROJECT")
+        if [ "$INPUT_FORCE" = "true" ]; then args+=(--force); fi
+        npx --yes "screenery@$INPUT_VERSION" push "${args[@]}"
