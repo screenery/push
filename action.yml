@@ -40,7 +40,7 @@ inputs:
       The `screenery` npm version to run. Pinned by default so a release of the
       CLI cannot change what a workflow does without the workflow changing.
     required: false
-    default: '0.1.0'
+    default: '0.2.0'
   api-url:
     description: Control plane origin. Only for a non-default deployment.
     required: false
@@ -60,6 +60,75 @@ inputs:
       content.
     required: false
     default: 'false'
+  diff-baseline:
+    description: >-
+      Optional committed baseline directory. When set, the Action runs a
+      pixelmatch-style comparison (and a findings delta, when findings.json
+      sidecars are present) against this folder BEFORE push. A visual or
+      findings regression fails the job and nothing is published. Omit to
+      push as before.
+    required: false
+    default: ''
+  diff-threshold:
+    description: >-
+      Pixelmatch threshold for `diff-baseline`, 0..1. Default 0.1, matching
+      pixelmatch / Refract. Ignored when `diff-baseline` is empty.
+    required: false
+    default: '0.1'
+  comment:
+    description: >-
+      Post or update a pull-request comment built from this build's Screenery
+      assets (4-up strip, walkthrough GIF/video, README/PR embed snippets).
+      `auto` (default) posts on pull_request when GITHUB_TOKEN can write.
+      `true` always tries. `false` never posts. Needs `permissions:
+      pull-requests: write` on the job; a missing permission is a warning,
+      not a failed push.
+    required: false
+    default: auto
+  gallery-out:
+    description: >-
+      Write gallery Markdown to this path. In GitHub Actions, a copy is also
+      written under $RUNNER_TEMP/screenery/ when this is empty.
+    required: false
+    default: ''
+  readme-out:
+    description: Write paste-once README embed Markdown to this path.
+    required: false
+    default: ''
+  comment-out:
+    description: Write the PR comment Markdown to this path, even if it is not posted.
+    required: false
+    default: ''
+
+outputs:
+  channel:
+    description: Channel the gallery and PR comment used (`pr-12`, `main`, `latest`, …).
+    value: ${{ steps.push.outputs.channel }}
+  comment-url:
+    description: HTML URL of the posted or updated pull-request comment, if any.
+    value: ${{ steps.push.outputs.comment_url }}
+  gallery-file:
+    description: Path of the written gallery Markdown.
+    value: ${{ steps.push.outputs.gallery_file }}
+  readme-file:
+    description: Path of the written README embed Markdown.
+    value: ${{ steps.push.outputs.readme_file }}
+  comment-file:
+    description: Path of the written PR comment Markdown.
+    value: ${{ steps.push.outputs.comment_file }}
+  # The Markdown bodies themselves, not just their paths. A composite action
+  # exposes ONLY what is declared here — `steps.push.outputs.*` is internal to
+  # this file — so a caller that wants to paste the gallery into a release note
+  # without reading a file needs these declared or it gets an empty string.
+  gallery-markdown:
+    description: Gallery Markdown for this build's preview channel.
+    value: ${{ steps.push.outputs.gallery_markdown }}
+  readme-markdown:
+    description: Paste-once README embed Markdown (`@latest`).
+    value: ${{ steps.push.outputs.readme_markdown }}
+  pr-comment-markdown:
+    description: The PR comment body, posted or not.
+    value: ${{ steps.push.outputs.pr_comment_markdown }}
 
 runs:
   using: composite
@@ -87,6 +156,7 @@ runs:
     # passed — and a caller is free to map a pull-request-controlled value onto
     # any of these. Through `env` they are data to bash, whatever they contain.
     - name: Push screenshots
+      id: push
       shell: bash
       env:
         SCREENERY_API_URL: ${{ inputs.api-url }}
@@ -95,8 +165,22 @@ runs:
         INPUT_PROJECT: ${{ inputs.project }}
         INPUT_FORCE: ${{ inputs.force }}
         INPUT_VERSION: ${{ inputs.version }}
+        INPUT_DIFF_BASELINE: ${{ inputs.diff-baseline }}
+        INPUT_DIFF_THRESHOLD: ${{ inputs.diff-threshold }}
+        INPUT_COMMENT: ${{ inputs.comment }}
+        INPUT_GALLERY_OUT: ${{ inputs.gallery-out }}
+        INPUT_README_OUT: ${{ inputs.readme-out }}
+        INPUT_COMMENT_OUT: ${{ inputs.comment-out }}
       run: |
         set -euo pipefail
         args=("$INPUT_PATH" --project "$INPUT_PROJECT")
         if [ "$INPUT_FORCE" = "true" ]; then args+=(--force); fi
+        if [ -n "$INPUT_DIFF_BASELINE" ]; then
+          args+=(--diff-baseline "$INPUT_DIFF_BASELINE" --diff-threshold "$INPUT_DIFF_THRESHOLD")
+        fi
+        if [ "$INPUT_COMMENT" = "true" ]; then args+=(--comment); fi
+        if [ "$INPUT_COMMENT" = "false" ]; then args+=(--no-comment); fi
+        if [ -n "$INPUT_GALLERY_OUT" ]; then args+=(--gallery-out "$INPUT_GALLERY_OUT"); fi
+        if [ -n "$INPUT_README_OUT" ]; then args+=(--readme-out "$INPUT_README_OUT"); fi
+        if [ -n "$INPUT_COMMENT_OUT" ]; then args+=(--comment-out "$INPUT_COMMENT_OUT"); fi
         npx --yes "screenery@$INPUT_VERSION" push "${args[@]}"
