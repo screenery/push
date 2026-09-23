@@ -40,7 +40,7 @@ inputs:
       The `screenery` npm version to run. Pinned by default so a release of the
       CLI cannot change what a workflow does without the workflow changing.
     required: false
-    default: '0.2.0'
+    default: '0.3.0'
   api-url:
     description: Control plane origin. Only for a non-default deployment.
     required: false
@@ -58,6 +58,17 @@ inputs:
       Promote even when the channel is ahead (spec §6's fast-forward rule).
       Off by default; a slow retry of an old commit must not clobber newer
       content.
+    required: false
+    default: 'false'
+  partial:
+    description: >-
+      Set `true` when this step is one of several pushes to the same project
+      (shards, or web and store screenshots from separate jobs or workflows).
+      By default a build makes the channels it moves (`@main`, `@pr-N`,
+      `@latest`) exactly this build: names it did not push are removed from
+      them, and their channel URLs answer 404. A partial build only adds and
+      updates. Needs a `version` that has `--partial` (a release newer than
+      0.3.0); the flag is only passed when this is `true`.
     required: false
     default: 'false'
   diff-baseline:
@@ -121,13 +132,19 @@ outputs:
   # this file — so a caller that wants to paste the gallery into a release note
   # without reading a file needs these declared or it gets an empty string.
   gallery-markdown:
-    description: Gallery Markdown for this build's preview channel.
+    description: >-
+      Gallery Markdown for this build, rendered from its screenery.gallery/1
+      document: groups, per-asset status, both URLs, dimensions, and the
+      @latest snippet fence.
     value: ${{ steps.push.outputs.gallery_markdown }}
   readme-markdown:
     description: Paste-once README embed Markdown (`@latest`).
     value: ${{ steps.push.outputs.readme_markdown }}
   pr-comment-markdown:
-    description: The PR comment body, posted or not.
+    description: >-
+      The PR comment body, posted or not: counts heading, gallery link, the
+      changed-first still strip at immutable URLs, the base sentence, and a
+      machine-readable pointer at the gallery document.
     value: ${{ steps.push.outputs.pr_comment_markdown }}
 
 runs:
@@ -164,6 +181,7 @@ runs:
         INPUT_PATH: ${{ inputs.path }}
         INPUT_PROJECT: ${{ inputs.project }}
         INPUT_FORCE: ${{ inputs.force }}
+        INPUT_PARTIAL: ${{ inputs.partial }}
         INPUT_VERSION: ${{ inputs.version }}
         INPUT_DIFF_BASELINE: ${{ inputs.diff-baseline }}
         INPUT_DIFF_THRESHOLD: ${{ inputs.diff-threshold }}
@@ -175,6 +193,7 @@ runs:
         set -euo pipefail
         args=("$INPUT_PATH" --project "$INPUT_PROJECT")
         if [ "$INPUT_FORCE" = "true" ]; then args+=(--force); fi
+        if [ "$INPUT_PARTIAL" = "true" ]; then args+=(--partial); fi
         if [ -n "$INPUT_DIFF_BASELINE" ]; then
           args+=(--diff-baseline "$INPUT_DIFF_BASELINE" --diff-threshold "$INPUT_DIFF_THRESHOLD")
         fi
