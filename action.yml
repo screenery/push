@@ -5,9 +5,11 @@
 #
 # A COMPOSITE action, deliberately. A JavaScript action would mean a bundled
 # `dist/` committed to the action's repository and kept in step with the CLI by
-# hand; a composite one runs `npx screenery@<version> push`, so the published
-# npm package is the single implementation and the Action is the four lines of
-# YAML plus the OIDC permission check below.
+# hand; a composite one installs `screenery@<version>` from npm and runs its
+# `push`, so the published npm package is the single implementation and the
+# Action is the four lines of YAML plus the OIDC permission check below. The
+# install runs with every credential removed from its environment; see the
+# push step.
 #
 # NO TOKEN INPUT. That is the point of the phase: in GitHub Actions the CLI
 # exchanges the runner's OIDC token for a 5-minute publish token (spec §5.1),
@@ -40,7 +42,7 @@ inputs:
       The `screenery` npm version to run. Pinned by default so a release of the
       CLI cannot change what a workflow does without the workflow changing.
     required: false
-    default: '0.3.0'
+    default: '0.4.0'
   api-url:
     description: Control plane origin. Only for a non-default deployment.
     required: false
@@ -67,8 +69,8 @@ inputs:
       By default a build makes the channels it moves (`@main`, `@pr-N`,
       `@latest`) exactly this build: names it did not push are removed from
       them, and their channel URLs answer 404. A partial build only adds and
-      updates. Needs a `version` that has `--partial` (a release newer than
-      0.3.0); the flag is only passed when this is `true`.
+      updates. Needs CLI 0.4.0 or later (the default `version`); the flag is
+      only passed when this is `true`.
     required: false
     default: 'false'
   diff-baseline:
@@ -76,26 +78,54 @@ inputs:
       Optional committed baseline directory. When set, the Action runs a
       pixelmatch-style comparison (and a findings delta, when findings.json
       sidecars are present) against this folder BEFORE push. A visual or
-      findings regression fails the job and nothing is published. Omit to
-      push as before.
+      findings regression fails the job and nothing is published. With CLI
+      0.4.0 and later, `failOn` in `screenery.config.json` decides which
+      grade of change is a regression (default: any change, as before). Omit
+      to push as before.
     required: false
     default: ''
   diff-threshold:
     description: >-
-      Pixelmatch threshold for `diff-baseline`, 0..1. Default 0.1, matching
-      pixelmatch / Refract. Ignored when `diff-baseline` is empty.
+      Pixelmatch threshold for `diff-baseline`, 0..1. Empty (the default)
+      leaves it to the CLI: `diff.threshold` in `screenery.config.json` when
+      the CLI reads that file, else 0.1, matching pixelmatch / Refract. Set it
+      only to override the file for this workflow. Ignored when
+      `diff-baseline` is empty.
     required: false
-    default: '0.1'
+    default: ''
+  playwright-snapshots:
+    description: >-
+      When true, publish only Playwright toHaveScreenshot goldens: media
+      files inside a directory whose name ends with `-snapshots`. Fixture
+      images and failure shots elsewhere under `path` are ignored. Set
+      `path` to the Playwright test directory or the configured snapshot
+      root — the default `test-results` does not contain those goldens, so
+      a compatible CLI finds nothing and exits with an error. Leave false
+      for an Argos upload folder (`./screenshots`) or a dedicated
+      snapshotDir, where every image is a screenshot. The same filter
+      applies to `diff-baseline`. Needs CLI 0.4.0 or later (the default
+      `version`).
+    required: false
+    default: 'false'
   comment:
     description: >-
       Post or update a pull-request comment built from this build's Screenery
       assets (4-up strip, walkthrough GIF/video, README/PR embed snippets).
-      `auto` (default) posts on pull_request when GITHUB_TOKEN can write.
-      `true` always tries. `false` never posts. Needs `permissions:
-      pull-requests: write` on the job; a missing permission is a warning,
-      not a failed push.
+      `auto` (default) posts on pull_request. `true` always tries. `false`
+      never posts. Who posts is the project's `pr_comment` setting: the
+      Screenery GitHub App (`screenery[bot]`, no job permission needed), or
+      this job with `github-token`, which needs `permissions: pull-requests:
+      write`. A missing permission is a warning, not a failed push.
     required: false
     default: auto
+  github-token:
+    description: >-
+      Token the CLI uses to post the PR comment when the project's
+      `pr_comment` is `ci`, or when the Screenery App cannot. Defaults to the
+      job's own token, so no `env:` block is needed. A `GITHUB_TOKEN` set in
+      the step's `env:` still wins, as it did before this input existed.
+    required: false
+    default: ${{ github.token }}
   gallery-out:
     description: >-
       Write gallery Markdown to this path. In GitHub Actions, a copy is also
@@ -108,6 +138,23 @@ inputs:
     default: ''
   comment-out:
     description: Write the PR comment Markdown to this path, even if it is not posted.
+    required: false
+    default: ''
+  fail-on:
+    description: >-
+      Comma-separated gallery statuses that fail the job after the build is
+      published: changed, removed, added. Empty (default) does not pass the
+      flag, and the push exits 0. When set, the CLI publishes
+      screenery.report/1 and exits 2 if the policy matches. The check is that
+      report, not a human approval. screenery_review is not consulted. Needs
+      CLI 0.4.0 or later (the default `version`); the flag is only passed
+      when this is non-empty.
+    required: false
+    default: ''
+  report-out:
+    description: >-
+      Write screenery.report/1 JSON to this path. Empty (default) does not
+      pass the flag. Needs CLI 0.4.0 or later (the default `version`).
     required: false
     default: ''
 
@@ -146,6 +193,15 @@ outputs:
       changed-first still strip at immutable URLs, the base sentence, and a
       machine-readable pointer at the gallery document.
     value: ${{ steps.push.outputs.pr_comment_markdown }}
+  report-gate:
+    description: >-
+      `published` or `failed` when this step wrote a screenery.report/1
+      (fail-on or report-out set, on a CLI that has those flags). Empty when
+      it did not. Not `approved`.
+    value: ${{ steps.push.outputs.report_gate }}
+  report-file:
+    description: Path of the written report JSON, when report-out was set.
+    value: ${{ steps.push.outputs.report_file }}
 
 runs:
   using: composite
@@ -185,21 +241,59 @@ runs:
         INPUT_VERSION: ${{ inputs.version }}
         INPUT_DIFF_BASELINE: ${{ inputs.diff-baseline }}
         INPUT_DIFF_THRESHOLD: ${{ inputs.diff-threshold }}
+        INPUT_PLAYWRIGHT_SNAPSHOTS: ${{ inputs.playwright-snapshots }}
         INPUT_COMMENT: ${{ inputs.comment }}
         INPUT_GALLERY_OUT: ${{ inputs.gallery-out }}
         INPUT_README_OUT: ${{ inputs.readme-out }}
         INPUT_COMMENT_OUT: ${{ inputs.comment-out }}
+        INPUT_FAIL_ON: ${{ inputs.fail-on }}
+        INPUT_REPORT_OUT: ${{ inputs.report-out }}
+        INPUT_GITHUB_TOKEN: ${{ inputs.github-token }}
       run: |
         set -euo pipefail
+        # INSTALL WITH NO SECRETS, THEN RUN WITH THEM.
+        #
+        # `npx` installs and runs in one step, so every credential in this
+        # step's environment was visible to install-time code from the
+        # registry. The CLI is installed first, into a folder of its own,
+        # with the job token, SCREENERY_TOKEN and the OIDC request pair
+        # removed from the environment and lifecycle scripts off. It has no
+        # runtime dependencies (esbuild bundles them into dist/), so
+        # `--ignore-scripts` costs nothing. Only then is the installed copy run,
+        # with the credentials it needs.
+        cli_dir="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/screenery-cli"
+        rm -rf "$cli_dir"
+        mkdir -p "$cli_dir"
+        env -u GITHUB_TOKEN -u INPUT_GITHUB_TOKEN -u SCREENERY_TOKEN \
+          -u ACTIONS_ID_TOKEN_REQUEST_TOKEN -u ACTIONS_ID_TOKEN_REQUEST_URL \
+          -u ACTIONS_RUNTIME_TOKEN \
+          npm install --prefix "$cli_dir" --no-save --no-package-lock \
+            --ignore-scripts --no-audit --no-fund --loglevel=error \
+            "screenery@$INPUT_VERSION"
+        cli="$cli_dir/node_modules/screenery/dist/bin.js"
+        if [ ! -f "$cli" ]; then
+          echo "::error title=Screenery::Installing screenery@$INPUT_VERSION did not produce $cli."
+          exit 1
+        fi
+
+        # The caller's own `env: GITHUB_TOKEN` first: that was the only way to
+        # hand the CLI a token before `github-token` existed, and a workflow
+        # that set a different token there must keep posting with it.
+        export GITHUB_TOKEN="${GITHUB_TOKEN:-$INPUT_GITHUB_TOKEN}"
         args=("$INPUT_PATH" --project "$INPUT_PROJECT")
         if [ "$INPUT_FORCE" = "true" ]; then args+=(--force); fi
         if [ "$INPUT_PARTIAL" = "true" ]; then args+=(--partial); fi
         if [ -n "$INPUT_DIFF_BASELINE" ]; then
-          args+=(--diff-baseline "$INPUT_DIFF_BASELINE" --diff-threshold "$INPUT_DIFF_THRESHOLD")
+          args+=(--diff-baseline "$INPUT_DIFF_BASELINE")
+          # Passed only when set: a flag always wins over screenery.config.json.
+          if [ -n "$INPUT_DIFF_THRESHOLD" ]; then args+=(--diff-threshold "$INPUT_DIFF_THRESHOLD"); fi
         fi
+        if [ "$INPUT_PLAYWRIGHT_SNAPSHOTS" = "true" ]; then args+=(--playwright-snapshots); fi
         if [ "$INPUT_COMMENT" = "true" ]; then args+=(--comment); fi
         if [ "$INPUT_COMMENT" = "false" ]; then args+=(--no-comment); fi
         if [ -n "$INPUT_GALLERY_OUT" ]; then args+=(--gallery-out "$INPUT_GALLERY_OUT"); fi
         if [ -n "$INPUT_README_OUT" ]; then args+=(--readme-out "$INPUT_README_OUT"); fi
         if [ -n "$INPUT_COMMENT_OUT" ]; then args+=(--comment-out "$INPUT_COMMENT_OUT"); fi
-        npx --yes "screenery@$INPUT_VERSION" push "${args[@]}"
+        if [ -n "$INPUT_FAIL_ON" ]; then args+=(--fail-on "$INPUT_FAIL_ON"); fi
+        if [ -n "$INPUT_REPORT_OUT" ]; then args+=(--report-out "$INPUT_REPORT_OUT"); fi
+        node "$cli" push "${args[@]}"

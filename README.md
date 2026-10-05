@@ -16,8 +16,12 @@ permissions:
   pull-requests: write
 ```
 
-**No token, and no secret to rotate.** The Action runs `npx screenery push`,
-which asks the runner for a GitHub OIDC token and exchanges it at
+**No token, and no secret to rotate.** The Action installs the `screenery` CLI
+from npm and runs `screenery push`. The install runs with install scripts off
+and with the job token, `SCREENERY_TOKEN` and the OIDC request variables
+removed from its environment, so code fetched from the registry never sees a
+credential; only the installed CLI, run afterwards, does. `push` asks the
+runner for a GitHub OIDC token and exchanges it at
 `POST /v1/oidc/exchange` for a publish token that lives five minutes. The
 exchange checks the repository's **numeric id** against the project's binding
 (spec §5.1), so a repository rename does not break publishing and a fork
@@ -29,25 +33,40 @@ cannot pass.
 | --- | --- | --- |
 | `project` | — | `{org}/{project}`. Required. One repository may feed several projects; this is what routes the build. |
 | `path` | `test-results` | Directory of screenshots, walked recursively. |
-| `version` | `0.3.0` | The `screenery` npm version to run. |
+| `version` | `0.4.0` | The `screenery` npm version to run. |
 | `api-url` | — | Control plane origin, for a non-default deployment. |
 | `oidc-audience` | — | What the OIDC token is minted for. Derived from `api-url` when unset. |
 | `force` | `false` | Promote even when the channel is ahead (spec §6). |
-| `partial` | `false` | This step is one of several pushes to the project (shards, web + store). A partial push never removes names from a channel. Needs a CLI `version` newer than `0.3.0`. |
-| `diff-baseline` | — | Optional committed baseline directory. When set, compare current screenshots (and `findings.json` sidecars) against it **before** push; a regression fails the job and nothing is published. |
-| `diff-threshold` | `0.1` | Pixelmatch threshold for `diff-baseline`, 0..1. |
-| `comment` | `auto` | Post or update a PR comment from this build. `auto` posts on `pull_request`. |
+| `partial` | `false` | This step is one of several pushes to the project (shards, web + store). A partial push never removes names from a channel. |
+| `diff-baseline` | — | Optional committed baseline directory. When set, compare current screenshots (and `findings.json` sidecars) against it **before** push; a regression fails the job and nothing is published. With CLI 0.4.0 and later, `failOn` in `screenery.config.json` decides which grade of change is a regression (default: any change, as before). |
+| `diff-threshold` | `''` | Pixelmatch threshold for `diff-baseline`, 0..1. Empty leaves it to the CLI: `diff.threshold` in `screenery.config.json` when the CLI reads that file (0.4.0 and later), else 0.1. Set it only to override the file. |
+| `playwright-snapshots` | `false` | Publish only Playwright `toHaveScreenshot` goldens (`*-snapshots` directories). When enabled, set `path` to the Playwright test directory or a snapshot root that contains those directories. Fixture images under `path` are ignored. Leave false for an Argos `./screenshots` folder or a dedicated `snapshotDir`. The same filter applies to `diff-baseline`. |
+| `comment` | `auto` | Post or update a PR comment from this build. `auto` posts on `pull_request`. Who posts is the project's `pr_comment` setting. |
+| `github-token` | `${{ github.token }}` | Token the CLI posts the comment with when the project's `pr_comment` is `ci`. An `env: GITHUB_TOKEN` on the step wins. |
 | `gallery-out` | — | Write gallery Markdown to this path. |
 | `readme-out` | — | Write paste-once README embed Markdown to this path. |
 | `comment-out` | — | Write the PR comment Markdown to this path. |
+| `fail-on` | — | Statuses that fail the job after the report is published: `changed`, `removed`, `added`, comma-separated. Empty does not pass the flag. The check is the report, not a human approval. |
+| `report-out` | — | Write `screenery.report/1` JSON to this path. Empty does not pass the flag. |
 
-`version` is pinned to `0.3.0`, which renders the PR comment from the
-`screenery.gallery/1` document: a changed/added/unchanged heading, a link to the
-hosted gallery, and changed shots first in the strip. Every input above except
-`partial` works at the default. `partial: true` passes `--partial`, which the CLI
-gained after `0.3.0`; set `version` to that release when you use it. Otherwise
-override `version` only
-to run a different CLI release on purpose.
+The `version` default is the CLI release this Action was last moved to, and
+every input above works at it. Since `0.3.0` the CLI renders the PR comment from
+the `screenery.gallery/1` document: a changed/added/unchanged heading, a link to
+the hosted gallery, and changed shots first in the strip. `partial`,
+`playwright-snapshots`, `fail-on` and `report-out` pass flags that `0.3.0` does
+not recognize, so a workflow that sets any of them and pins `version` to
+`0.3.0` fails the job. Override `version` only to run a different CLI release
+on purpose.
+
+Playwright `toHaveScreenshot` remains the pixel gate. The Action publishes the
+golden directory after that gate passes. An Argos upload folder is
+`path: screenshots` with `playwright-snapshots` left false. The full recipe is
+the `screenery-playwright-goldens` skill.
+
+`fail-on` does not stop the upload. The build is finalized, the report is
+published, and the step exits non-zero when the policy matches (`gate:
+failed`). An empty `fail-on` leaves the push's exit code alone. Nothing in
+this Action approves a build or promotes a channel because a person said so.
 
 **Each push makes its channels exactly that push.** `@main`, `@pr-N` and (on
 the default branch) `@latest` end up holding what this step pushed; a name
@@ -57,8 +76,8 @@ The step prints which names went and adds a notice to the run summary. Jobs of
 the **same** workflow run do not remove each other's names on the first
 attempt (re-running one failed job alone makes it the newest snapshot), because they share
 an ordering key; separate workflows or separate `screenery push` calls feeding
-one project need `partial: true` on each, or the project's `channel_mode` set
-to `additive`. The server applies this rule to every push, whatever CLI
+one project need `partial: true` on each, or the project's channel mode set
+to `additive` on the console's Access screen. The server applies this rule to every push, whatever CLI
 version sent it.
 
 Every input travels through the step's `env` and none is interpolated into the
@@ -72,9 +91,13 @@ from the environment when a caller sets one — a self-hosted runner with no
 OIDC, or a deployment with no GitHub App — but offering an input for it would
 make the secret path look like the normal path, and it is not.
 
-`pull-requests: write` is what lets the step post (or update) a preview
-comment. Without it the push still succeeds; the log warns and the gallery
-Markdown is still written.
+Who posts the preview comment is the project's `pr_comment` setting. On
+`screenery` the Screenery GitHub App posts it as `screenery[bot]` and the job
+needs no token for it. On `ci` the step posts it with `github-token`, which
+defaults to the job's own token, so no `env: GITHUB_TOKEN` block is needed;
+the job needs `pull-requests: write` for that. A `GITHUB_TOKEN` set in the
+step's `env:` still wins over the input. Without the permission the push
+still succeeds; the log warns and the gallery Markdown is still written.
 
 ## After the push: PR comment, gallery, README snippets
 
@@ -155,8 +178,22 @@ runs your base branch's code, and is a decision rather than a workaround).
 
 ## Publishing this action
 
-This directory is the source. `screenery/push@v1` is a separate repository, and
-the release step is to copy `action.yml` and this README there and tag it — a
-composite action needs nothing built. Pin `version` to the `screenery` npm
-release the tag corresponds to, so a CLI release cannot change what an existing
+This repository is the source. A composite action needs nothing built, so a
+change is a pull request here and a merge. `version` pins the `screenery` npm
+release the Action runs, so a CLI release cannot change what an existing
 workflow does.
+
+A release of the Action takes three steps, and the last stays human:
+
+1. **The CLI is on npm.** `npm view screenery versions` lists the release.
+2. **A pull request here** moves the `version` default in `action.yml` and its
+   row in the input table above, plus any input the release adds. Merging it
+   changes nothing for callers yet.
+3. **Moving `v1`** is a person's call, because it changes every caller at once:
+
+   ```bash
+   git fetch origin && git tag -f v1 origin/main && git push origin v1 --force
+   ```
+
+A daily check in the Screenery repository fails while the pin names a version
+npm does not serve, or while `v1` is behind `main` here.
